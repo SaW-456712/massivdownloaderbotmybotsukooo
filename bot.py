@@ -1,6 +1,9 @@
 import os
 import asyncio
 import logging
+import urllib.request
+import urllib.parse
+import re
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import Command
@@ -16,7 +19,7 @@ BOT_USERNAME = "@zombie_dl_bot"  # Замени на юзернейм твоег
 
 TXT_START = "👋🔗 Просто отправь мне ссылку на **YouTube, TikTok или SoundCloud**."
 TXT_PROCESSING = "⏳ Обработка..."
-TXT_LIMIT_EXCEEDED = "⚠️ Ограничение на видео 25 минут!"
+TXT_LIMIT_EXCEEDED = "⚠️ Ограничение на video 25 минут!"
 TXT_CHOOSE_FORMAT = "🎬 Выберите формат для скачивания:"
 TXT_RECORD_BUTTON = "📊 Рекорд (Статистика)"
 TXT_SEARCH_BUTTON = "🔍 Поиск в SoundCloud"
@@ -42,29 +45,14 @@ dp = Dispatcher(storage=MemoryStorage())
 # Хранилище статистики
 STATS = {"audio": 0, "video": 0}
 
-# Максимально агрессивные настройки для обхода блокировок YouTube, TikTok и SoundCloud
+# Базовые опции скачивания
 YTDL_COMMON_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'socket_timeout': 30,
     'source_address': '0.0.0.0',
-    'rm_cached_media': True,  # Очищать медиа-кэш для стабильности
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'ios'], # Смесь клиентов для обхода капчи
-            'skip': ['dash', 'hls']
-        },
-        'tiktok': {
-            'app_version': '33.3.4', # Имитация актуальной версии приложения
-            'manifest_version': 'code'
-        }
-    },
-    # Реалистичный юзер-агент мобильного устройства для TikTok/YouTube
-    'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-    'http_headers': {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8',
-    }
+    'rm_cached_media': True,
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
 }
 
 class BotStates(StatesGroup):
@@ -94,9 +82,44 @@ def clean_filename(title: str) -> str:
 
 async def safe_edit_text(msg: Message, text: str):
     try:
-        await msg.edit_text(text)
+        await msg.edit_text(text, parse_mode="Markdown", disable_web_page_preview=True)
     except Exception:
-        await msg.answer(text)
+        await msg.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+
+# Функция парсинга HTML YouTube без использования API yt-dlp
+def scrape_youtube_search(query: str):
+    try:
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://www.youtube.com/results?search_query={encoded_query}"
+        
+        req = urllib.request.Request(
+            url, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        )
+        
+        html = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
+        # Ищем ID видео и их названия в JSON-структуре страницы YouTube
+        video_ids = re.findall(r"\"videoId\":\"([^\"]+)\"", html)
+        titles = re.findall(r"\"title\":\{\"runs\":\[\{\"text\":\"([^\"]+)\"\}", html)
+        
+        results = []
+        seen_ids = set()
+        
+        for i in range(len(video_ids)):
+            v_id = video_ids[i]
+            if v_id not in seen_ids:
+                seen_ids.add(v_id)
+                # Берем соответствующее название, если оно есть
+                v_title = titles[i] if i < len(titles) else "Ремикс/Трек"
+                # Декодируем юникод-символы в названии, если они смазались
+                v_title = v_title.encode().decode('unicode-escape', errors='ignore')
+                results.append({"id": v_id, "title": v_title})
+                if len(results) >= 5: # Нам нужно топ-5 результатов
+                    break
+        return results
+    except Exception as e:
+        logging.error(f"Scraping error: {e}")
+        return []
 
 async def download_media(url: str, mode: str, message: Message):
     status_msg = await message.answer(TXT_PROCESSING)
@@ -110,7 +133,6 @@ async def download_media(url: str, mode: str, message: Message):
             if not info:
                 raise ValueError("Не удалось извлечь информацию о файле.")
             
-            # В TikTok структура ответа может отличаться, обрабатываем аккуратно
             duration = info.get('duration', 0)
             title = clean_filename(info.get('title', 'media'))
             
@@ -124,7 +146,7 @@ async def download_media(url: str, mode: str, message: Message):
         if mode == "mp3":
             ydl_opts = {
                 **YTDL_COMMON_OPTS,
-                'format': 'ba/b', # Сначала только аудио, если нет — берем лучшее и конвертируем
+                'format': 'ba/b',
                 'outtmpl': out_template,
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
@@ -144,7 +166,6 @@ async def download_media(url: str, mode: str, message: Message):
         elif mode == "mp4":
             ydl_opts = {
                 **YTDL_COMMON_OPTS,
-                # Для TikTok и YouTube забираем либо готовый mp4, либо просто лучшее видео со звуком в одном потоке
                 'format': 'b[ext=mp4]/bestvideo+bestaudio/b', 
                 'outtmpl': out_template,
             }
@@ -152,7 +173,6 @@ async def download_media(url: str, mode: str, message: Message):
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
                 if not filename.endswith('.mp4'):
-                    # Перестраховка на случай изменения расширения yt-dlp
                     base_path = filename.rsplit('.', 1)[0]
                     if os.path.exists(base_path + ".mp4"):
                         filename = base_path + ".mp4"
@@ -204,46 +224,34 @@ async def search_sc_process(message: Message, state: FSMContext):
 
     status_msg = await message.answer(TXT_SEARCH_ING)
     
-    ydl_opts = {
-        **YTDL_COMMON_OPTS,
-        'extract_flat': True,
-        'skip_download': True,
-    }
-    
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            search_result = ydl.extract_info(f"ytsearch5:{query}", download=False)
-            entries = search_result.get('entries', []) if search_result else []
-            
-            if not entries:
-                await safe_edit_text(status_msg, TXT_NOT_FOUND)
-                await state.clear()
-                return
-            
-            response_text = "🎵 **Найденные треки:**\n\n"
-            valid_tracks_count = 0
-            
-            for i, entry in enumerate(entries, 1):
-                title = entry.get('title', 'Без названия')
-                video_id = entry.get('id')
-                if video_id:
-                    url = f"https://www.youtube.com/watch?v={video_id}"
-                    response_text += f"{i}. [{title}]({url})\n\n"
-                    valid_tracks_count += 1
-            
-            if valid_tracks_count == 0:
-                await safe_edit_text(status_msg, TXT_NOT_FOUND)
-                await state.clear()
-                return
-
-            response_text += "👉 **Нажмите на нужную ссылку выше, отправьте её мне в чат, и я пришлю её в MP3!**"
-            
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            await message.answer(response_text, parse_mode="Markdown", disable_web_page_preview=True)
-            
+        # Запускаем парсинг веб-страницы в отдельном потоке, чтобы бот не зависал
+        loop = asyncio.get_event_loop()
+        entries = await loop.run_in_executor(None, scrape_youtube_search, query)
+        
+        if not entries:
+            await safe_edit_text(status_msg, TXT_NOT_FOUND)
+            await state.clear()
+            return
+        
+        response_text = "🎵 **Найденные треки:**\n\n"
+        valid_tracks_count = 0
+        
+        for i, entry in enumerate(entries, 1):
+            title = entry["title"]
+            video_id = entry["id"]
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            response_text += f"{i}. [{title}]({url})\n\n"
+            valid_tracks_count += 1
+        
+        response_text += "👉 **Нажмите на нужную ссылку выше, отправьте её мне в чат, и я пришлю её в MP3!**"
+        
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.answer(response_text, parse_mode="Markdown", disable_web_page_preview=True)
+        
     except Exception as e:
         logging.error(f"Ошибка поиска: {e}")
         await safe_edit_text(status_msg, TXT_ERROR)
@@ -255,7 +263,6 @@ async def handle_urls(message: Message, state: FSMContext):
     url = message.text.strip()
     await state.clear()
     
-    # Обрабатываем все типы ссылок TikTok (vt.tiktok, vm.tiktok, www.tiktok)
     if "soundcloud.com" in url:
         await download_media(url, "mp3", message)
     elif "youtube.com" in url or "youtu.be" in url or "tiktok.com" in url:
@@ -263,7 +270,6 @@ async def handle_urls(message: Message, state: FSMContext):
         await state.set_state(BotStates.waiting_for_format_selection)
         await message.answer(TXT_CHOOSE_FORMAT, reply_markup=get_format_keyboard())
     else:
-        # Резервный запуск
         await state.update_data(current_url=url)
         await state.set_state(BotStates.waiting_for_format_selection)
         await message.answer(TXT_CHOOSE_FORMAT, reply_markup=get_format_keyboard())
