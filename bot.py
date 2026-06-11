@@ -42,17 +42,28 @@ dp = Dispatcher(storage=MemoryStorage())
 # Хранилище статистики
 STATS = {"audio": 0, "video": 0}
 
-# Современные базовые опции для yt-dlp, помогающие обойти защиту от роботов
+# Максимально агрессивные настройки для обхода блокировок YouTube, TikTok и SoundCloud
 YTDL_COMMON_OPTS = {
     'quiet': True,
     'no_warnings': True,
-    'format': 'best',
     'socket_timeout': 30,
     'source_address': '0.0.0.0',
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'rm_cached_media': True,  # Очищать медиа-кэш для стабильности
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'ios'], # Смесь клиентов для обхода капчи
+            'skip': ['dash', 'hls']
+        },
+        'tiktok': {
+            'app_version': '33.3.4', # Имитация актуальной версии приложения
+            'manifest_version': 'code'
+        }
+    },
+    # Реалистичный юзер-агент мобильного устройства для TikTok/YouTube
+    'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
     'http_headers': {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8',
     }
 }
 
@@ -70,7 +81,6 @@ def get_main_keyboard():
     )
 
 def get_format_keyboard():
-    # Больше НЕ передаем URL в callback_data, чтобы избежать падения из-за лимита в 64 байта
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=BTN_MP3, callback_data="fmt_mp3")],
         [InlineKeyboardButton(text=BTN_MP4, callback_data="fmt_mp4")],
@@ -82,24 +92,30 @@ def clean_filename(title: str) -> str:
         title = title.replace(c, '')
     return title.strip() or "media_file"
 
+async def safe_edit_text(msg: Message, text: str):
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        await msg.answer(text)
+
 async def download_media(url: str, mode: str, message: Message):
     status_msg = await message.answer(TXT_PROCESSING)
     clean_bot_name = BOT_USERNAME.replace("@", "")
     
-    ydl_opts_info = {**YTDL_COMMON_OPTS, 'skip_download': True}
+    ydl_opts_info = {**YTDL_COMMON_OPTS, 'skip_download': True, 'ignoreerrors': True}
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
-                raise ValueError("Не удалось извлечь информацию о медиа-файле")
-                
+                raise ValueError("Не удалось извлечь информацию о файле.")
+            
+            # В TikTok структура ответа может отличаться, обрабатываем аккуратно
             duration = info.get('duration', 0)
             title = clean_filename(info.get('title', 'media'))
             
-            # Проверка лимита 25 минут (1500 секунд)
             if duration and duration > 1500:
-                await status_msg.edit_text(TXT_LIMIT_EXCEEDED)
+                await safe_edit_text(status_msg, TXT_LIMIT_EXCEEDED)
                 return
 
         out_template = f"downloads/{title}_{clean_bot_name}.%(ext)s"
@@ -108,7 +124,7 @@ async def download_media(url: str, mode: str, message: Message):
         if mode == "mp3":
             ydl_opts = {
                 **YTDL_COMMON_OPTS,
-                'format': 'bestaudio/best',
+                'format': 'ba/b', # Сначала только аудио, если нет — берем лучшее и конвертируем
                 'outtmpl': out_template,
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
@@ -128,28 +144,35 @@ async def download_media(url: str, mode: str, message: Message):
         elif mode == "mp4":
             ydl_opts = {
                 **YTDL_COMMON_OPTS,
-                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                # Для TikTok и YouTube забираем либо готовый mp4, либо просто лучшее видео со звуком в одном потоке
+                'format': 'b[ext=mp4]/bestvideo+bestaudio/b', 
                 'outtmpl': out_template,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
                 if not filename.endswith('.mp4'):
-                    filename = filename.rsplit('.', 1)[0] + ".mp4"
+                    # Перестраховка на случай изменения расширения yt-dlp
+                    base_path = filename.rsplit('.', 1)[0]
+                    if os.path.exists(base_path + ".mp4"):
+                        filename = base_path + ".mp4"
+                    elif os.path.exists(filename):
+                        os.rename(filename, base_path + ".mp4")
+                        filename = base_path + ".mp4"
                     
             await message.reply_video(FSInputFile(filename))
             STATS["video"] += 1
             if os.path.exists(filename):
                 os.remove(filename)
             
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
     except Exception as e:
         logging.error(f"Ошибка при скачивании: {e}")
-        try:
-            await status_msg.edit_text(TXT_ERROR)
-        except Exception:
-            await message.answer(TXT_ERROR)
+        await safe_edit_text(status_msg, TXT_ERROR)
 
 
 # --- ОБРАБОТЧИКИ СОБЫТИЙ ---
@@ -173,6 +196,12 @@ async def search_sc_start(message: Message, state: FSMContext):
 @dp.message(BotStates.waiting_for_search_query)
 async def search_sc_process(message: Message, state: FSMContext):
     query = message.text.strip()
+    
+    if "http://" in query or "https://" in query:
+        await state.clear()
+        await handle_urls(message, state)
+        return
+
     status_msg = await message.answer(TXT_SEARCH_ING)
     
     ydl_opts = {
@@ -183,12 +212,11 @@ async def search_sc_process(message: Message, state: FSMContext):
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Ищем треки именно на SoundCloud
-            search_result = ydl.extract_info(f"scsearch5:{query}", download=False)
+            search_result = ydl.extract_info(f"ytsearch5:{query}", download=False)
             entries = search_result.get('entries', []) if search_result else []
             
             if not entries:
-                await status_msg.edit_text(TXT_NOT_FOUND)
+                await safe_edit_text(status_msg, TXT_NOT_FOUND)
                 await state.clear()
                 return
             
@@ -197,42 +225,48 @@ async def search_sc_process(message: Message, state: FSMContext):
             
             for i, entry in enumerate(entries, 1):
                 title = entry.get('title', 'Без названия')
-                url = entry.get('url') or entry.get('webpage_url')
-                if url:
+                video_id = entry.get('id')
+                if video_id:
+                    url = f"https://www.youtube.com/watch?v={video_id}"
                     response_text += f"{i}. [{title}]({url})\n\n"
                     valid_tracks_count += 1
             
             if valid_tracks_count == 0:
-                await status_msg.edit_text(TXT_NOT_FOUND)
+                await safe_edit_text(status_msg, TXT_NOT_FOUND)
                 await state.clear()
                 return
 
-            response_text += "👉 **Нажмите на нужную ссылку выше (скопируйте её), отправьте мне в чат, и я её скачаю!**"
+            response_text += "👉 **Нажмите на нужную ссылку выше, отправьте её мне в чат, и я пришлю её в MP3!**"
             
-            await status_msg.delete()
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
             await message.answer(response_text, parse_mode="Markdown", disable_web_page_preview=True)
             
     except Exception as e:
         logging.error(f"Ошибка поиска: {e}")
-        await status_msg.edit_text(TXT_ERROR)
+        await safe_edit_text(status_msg, TXT_ERROR)
     
     await state.clear()
 
 @dp.message(F.text.contains("http://") | F.text.contains("https://"))
 async def handle_urls(message: Message, state: FSMContext):
     url = message.text.strip()
+    await state.clear()
     
+    # Обрабатываем все типы ссылок TikTok (vt.tiktok, vm.tiktok, www.tiktok)
     if "soundcloud.com" in url:
-        # Саундклауд скачиваем сразу в MP3
         await download_media(url, "mp3", message)
     elif "youtube.com" in url or "youtu.be" in url or "tiktok.com" in url:
-        # Сохраняем URL в состоянии пользователя (чтобы не передавать через кнопки и не вызывать падение)
         await state.update_data(current_url=url)
         await state.set_state(BotStates.waiting_for_format_selection)
         await message.answer(TXT_CHOOSE_FORMAT, reply_markup=get_format_keyboard())
     else:
-        # Любые прочие ссылки по умолчанию пытаемся забрать как видео
-        await download_media(url, "mp4", message)
+        # Резервный запуск
+        await state.update_data(current_url=url)
+        await state.set_state(BotStates.waiting_for_format_selection)
+        await message.answer(TXT_CHOOSE_FORMAT, reply_markup=get_format_keyboard())
 
 @dp.callback_query(BotStates.waiting_for_format_selection, F.data.startswith("fmt_"))
 async def process_download_callback(callback: CallbackQuery, state: FSMContext):
@@ -247,8 +281,12 @@ async def process_download_callback(callback: CallbackQuery, state: FSMContext):
         return
         
     mode = callback.data.replace("fmt_", "")
-    await callback.message.delete()
-    await state.clear()  # Сбрасываем состояние после выбора
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+        
+    await state.clear() 
     
     if mode == "both":
         await download_media(url, "mp3", callback.message)
