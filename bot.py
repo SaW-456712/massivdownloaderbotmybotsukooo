@@ -31,7 +31,6 @@ BTN_MP4 = "🎥 MP4 (Видео)"
 BTN_BOTH = "🔄 MP3 & MP4"
 # ==========================================
 
-# Инициализация логов и бота
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
@@ -40,13 +39,27 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Хранилище статистики (в памяти, сбросится при перезапуске. Для надежности нужен Redis/DB)
+# Хранилище статистики
 STATS = {"audio": 0, "video": 0}
 
-class SearchStates(StatesGroup):
-    waiting_for_query = State()
+# Современные базовые опции для yt-dlp, помогающие обойти защиту от роботов
+YTDL_COMMON_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'format': 'best',
+    'socket_timeout': 30,
+    'source_address': '0.0.0.0',
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'http_headers': {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+    }
+}
 
-# Главное меню (Ремоут кнопки внизу)
+class BotStates(StatesGroup):
+    waiting_for_search_query = State()
+    waiting_for_format_selection = State()
+
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -56,48 +69,45 @@ def get_main_keyboard():
         resize_keyboard=True
     )
 
-# Инлайн кнопки выбора формата для YT/TikTok
-def get_format_keyboard(url: str):
-    # Кодируем URL в callback_data аккуратно (длина callback_data ограничена 64 байтами)
-    # Используем хэш или просто режем, но лучше передавать тип и ID, для простоты запишем в стейт или передадим часть.
-    # Чтобы не упасть по лимиту длины, сохраняем урл, но здесь для простоты передадим через разделитель, если URL короткий.
-    # Безопаснее: использовать inline-кнопки с префиксами.
+def get_format_keyboard():
+    # Больше НЕ передаем URL в callback_data, чтобы избежать падения из-за лимита в 64 байта
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=BTN_MP3, callback_data=f"down:mp3:{url}")],
-        [InlineKeyboardButton(text=BTN_MP4, callback_data=f"down:mp4:{url}")],
-        [InlineKeyboardButton(text=BTN_BOTH, callback_data=f"down:both:{url}")]
+        [InlineKeyboardButton(text=BTN_MP3, callback_data="fmt_mp3")],
+        [InlineKeyboardButton(text=BTN_MP4, callback_data="fmt_mp4")],
+        [InlineKeyboardButton(text=BTN_BOTH, callback_data="fmt_both")]
     ])
 
 def clean_filename(title: str) -> str:
-    # Удаляем запрещенные символы для имени файла
-    for c in ['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>']:
+    for c in ['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>', '.', ',', '(', ')', '[', ']', '{', '}']:
         title = title.replace(c, '')
-    return title.strip()
+    return title.strip() or "media_file"
 
 async def download_media(url: str, mode: str, message: Message):
     status_msg = await message.answer(TXT_PROCESSING)
     clean_bot_name = BOT_USERNAME.replace("@", "")
     
-    # Опции для извлечения инфо
-    ydl_opts_info = {'skip_download': True}
+    ydl_opts_info = {**YTDL_COMMON_OPTS, 'skip_download': True}
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
             info = ydl.extract_info(url, download=False)
+            if not info:
+                raise ValueError("Не удалось извлечь информацию о медиа-файле")
+                
             duration = info.get('duration', 0)
             title = clean_filename(info.get('title', 'media'))
             
             # Проверка лимита 25 минут (1500 секунд)
-            if duration > 1500:
+            if duration and duration > 1500:
                 await status_msg.edit_text(TXT_LIMIT_EXCEEDED)
                 return
 
         out_template = f"downloads/{title}_{clean_bot_name}.%(ext)s"
         os.makedirs("downloads", exist_ok=True)
 
-        # Скачивание аудио
         if mode == "mp3":
             ydl_opts = {
+                **YTDL_COMMON_OPTS,
                 'format': 'bestaudio/best',
                 'outtmpl': out_template,
                 'postprocessors': [{
@@ -112,11 +122,12 @@ async def download_media(url: str, mode: str, message: Message):
                 
             await message.reply_audio(FSInputFile(filename))
             STATS["audio"] += 1
-            os.remove(filename)
+            if os.path.exists(filename):
+                os.remove(filename)
 
-        # Скачивание видео
         elif mode == "mp4":
             ydl_opts = {
+                **YTDL_COMMON_OPTS,
                 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                 'outtmpl': out_template,
             }
@@ -128,19 +139,24 @@ async def download_media(url: str, mode: str, message: Message):
                     
             await message.reply_video(FSInputFile(filename))
             STATS["video"] += 1
-            os.remove(filename)
+            if os.path.exists(filename):
+                os.remove(filename)
             
         await status_msg.delete()
 
     except Exception as e:
-        logging.error(e)
-        await status_msg.edit_text(TXT_ERROR)
+        logging.error(f"Ошибка при скачивании: {e}")
+        try:
+            await status_msg.edit_text(TXT_ERROR)
+        except Exception:
+            await message.answer(TXT_ERROR)
 
 
-# --- ХЕНДЛЕРЫ ---
+# --- ОБРАБОТЧИКИ СОБЫТИЙ ---
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(TXT_START, reply_markup=get_main_keyboard())
 
 @dp.message(F.text == TXT_RECORD_BUTTON)
@@ -152,80 +168,87 @@ async def show_record(message: Message):
 @dp.message(F.text == TXT_SEARCH_BUTTON)
 async def search_sc_start(message: Message, state: FSMContext):
     await message.answer(TXT_ENTER_QUERY)
-    await state.set_state(SearchStates.waiting_for_query)
+    await state.set_state(BotStates.waiting_for_search_query)
 
-@dp.message(SearchStates.waiting_for_query)
+@dp.message(BotStates.waiting_for_search_query)
 async def search_sc_process(message: Message, state: FSMContext):
-    query = message.text
+    query = message.text.strip()
     status_msg = await message.answer(TXT_SEARCH_ING)
     
     ydl_opts = {
-        'default_search': 'ytsearch',
+        **YTDL_COMMON_OPTS,
         'extract_flat': True,
         'skip_download': True,
     }
-    # Для SoundCloud используем scsearch, если yt-dlp настроен. По дефолту надежнее искать через ytsearch (ютуб) или scsearch.
-    # Заменим на поиск в soundcloud: `scsearch5:query`
-    ydl_opts['default_search'] = 'scsearch'
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Ищем первые 5 результатов
+            # Ищем треки именно на SoundCloud
             search_result = ydl.extract_info(f"scsearch5:{query}", download=False)
-            entries = search_result.get('entries', [])
+            entries = search_result.get('entries', []) if search_result else []
             
             if not entries:
                 await status_msg.edit_text(TXT_NOT_FOUND)
                 await state.clear()
                 return
             
-            buttons = []
-            for entry in entries:
-                title = entry.get('title', 'Track')
+            response_text = "🎵 **Найденные треки:**\n\n"
+            valid_tracks_count = 0
+            
+            for i, entry in enumerate(entries, 1):
+                title = entry.get('title', 'Без названия')
                 url = entry.get('url') or entry.get('webpage_url')
                 if url:
-                    # Сокращаем название для инлайн кнопки (лимит 64 символа на callback_data целиком!)
-                    # Чтобы не выйти за лимиты callback_data, запишем в callback только префикс скачивания mp3
-                    # Но url может быть длинным. Безопаснее вставить прямую ссылку в кнопку:
-                    buttons.append([InlineKeyboardButton(text=f"🎵 {title[:40]}", callback_data=f"down:mp3:{url}")])
+                    response_text += f"{i}. [{title}]({url})\n\n"
+                    valid_tracks_count += 1
             
-            keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+            if valid_tracks_count == 0:
+                await status_msg.edit_text(TXT_NOT_FOUND)
+                await state.clear()
+                return
+
+            response_text += "👉 **Нажмите на нужную ссылку выше (скопируйте её), отправьте мне в чат, и я её скачаю!**"
+            
             await status_msg.delete()
-            await message.answer("🎵 Выберите найденный трек:", reply_markup=keyboard)
+            await message.answer(response_text, parse_mode="Markdown", disable_web_page_preview=True)
             
     except Exception as e:
-        logging.error(e)
+        logging.error(f"Ошибка поиска: {e}")
         await status_msg.edit_text(TXT_ERROR)
     
     await state.clear()
 
 @dp.message(F.text.contains("http://") | F.text.contains("https://"))
-async def handle_urls(message: Message):
+async def handle_urls(message: Message, state: FSMContext):
     url = message.text.strip()
     
     if "soundcloud.com" in url:
-        # Для SoundCloud сразу качаем mp3
+        # Саундклауд скачиваем сразу в MP3
         await download_media(url, "mp3", message)
     elif "youtube.com" in url or "youtu.be" in url or "tiktok.com" in url:
-        # Для YT и ТТ предлагаем выбор
-        # Внимание: Длина URL в callback_data ограничена. Если URL > 45 символов, это вызовет ошибку Telegram.
-        # Поэтому сделаем "умный" фолбек: если ссылка слишком длинная, просто качаем mp4 по дефолту, либо просим выбрать текстом.
-        if len(url) < 45:
-            await message.answer(TXT_CHOOSE_FORMAT, reply_markup=get_format_keyboard(url))
-        else:
-            # Если ссылка длинная, качаем MP4 по умолчанию
-            await download_media(url, "mp4", message)
+        # Сохраняем URL в состоянии пользователя (чтобы не передавать через кнопки и не вызывать падение)
+        await state.update_data(current_url=url)
+        await state.set_state(BotStates.waiting_for_format_selection)
+        await message.answer(TXT_CHOOSE_FORMAT, reply_markup=get_format_keyboard())
     else:
-        # Любые другие ссылки пробуем как видео
+        # Любые прочие ссылки по умолчанию пытаемся забрать как видео
         await download_media(url, "mp4", message)
 
-@dp.callback_query(F.data.startswith("down:"))
-async def process_download_callback(callback: CallbackQuery):
+@dp.callback_query(BotStates.waiting_for_format_selection, F.data.startswith("fmt_"))
+async def process_download_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    _, mode, url = callback.data.split(":", 2)
     
-    # Удаляем сообщение с кнопками выбора, чтобы пользователь не тыкал повторно
+    user_data = await state.get_data()
+    url = user_data.get("current_url")
+    
+    if not url:
+        await callback.message.answer(TXT_ERROR)
+        await state.clear()
+        return
+        
+    mode = callback.data.replace("fmt_", "")
     await callback.message.delete()
+    await state.clear()  # Сбрасываем состояние после выбора
     
     if mode == "both":
         await download_media(url, "mp3", callback.message)
