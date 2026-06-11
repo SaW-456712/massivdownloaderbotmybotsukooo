@@ -1,9 +1,7 @@
 import os
 import asyncio
 import logging
-import urllib.request
-import urllib.parse
-import re
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import Command
@@ -13,22 +11,16 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import yt_dlp
 
 # ==========================================
-# БЛОК НАСТРОЕК И ТЕКСТОВЫХ ПЕРЕМЕННЫХ (Кастомизируй тут)
+# БЛОК НАСТРОЕК И ТЕКСТОВЫХ ПЕРЕМЕННЫХ
 # ==========================================
-BOT_USERNAME = "@zombie_dl_bot"  # Замени на юзернейм твоего бота (без @ в названии файла, код сам уберет)
+BOT_USERNAME = "@zombie_dl_bot"  # Замени на юзернейм твоего бота
 
 TXT_START = "👋🔗 Просто отправь мне ссылку на **YouTube, TikTok или SoundCloud**."
-TXT_PROCESSING = "⏳ Обработка..."
-TXT_LIMIT_EXCEEDED = "⚠️ Ограничение на video 25 минут!"
+TXT_PROCESSING = "⏳ Скачиваю и обрабатываю файл через удаленный сервер..."
 TXT_CHOOSE_FORMAT = "🎬 Выберите формат для скачивания:"
 TXT_RECORD_BUTTON = "📊 Рекорд (Статистика)"
-TXT_SEARCH_BUTTON = "🔍 Поиск в SoundCloud"
-TXT_ENTER_QUERY = "🎵 Введите имя артиста и название трека для поиска:"
-TXT_SEARCH_ING = "🔎 Ищу треки..."
-TXT_NOT_FOUND = "❌ Ничего не найдено."
-TXT_ERROR = "❌ Произошла ошибка при обработке."
+TXT_ERROR = "❌ Произошла ошибка при обработке файла сторонним сервисом."
 
-# Кнопки форматов
 BTN_MP3 = "🎵 MP3 (Аудио)"
 BTN_MP4 = "🎥 MP4 (Видео)"
 BTN_BOTH = "🔄 MP3 & MP4"
@@ -45,24 +37,31 @@ dp = Dispatcher(storage=MemoryStorage())
 # Хранилище статистики
 STATS = {"audio": 0, "video": 0}
 
-# Базовые опции скачивания
-YTDL_COMMON_OPTS = {
+# Публичный инстанс Cobalt API для обхода блокировок YT/TikTok
+COBALT_API_URL = "https://api.cobalt.tools/api/json"
+
+# Оставляем чистый yt-dlp только для SoundCloud
+YTDL_SOUNDCLOUD_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'socket_timeout': 30,
     'source_address': '0.0.0.0',
     'rm_cached_media': True,
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'format': 'ba/b',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '192',
+    }],
 }
 
 class BotStates(StatesGroup):
-    waiting_for_search_query = State()
     waiting_for_format_selection = State()
 
 def get_main_keyboard():
+    # Кнопка поиска временно удалена, осталась только статистика
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=TXT_SEARCH_BUTTON)],
             [KeyboardButton(text=TXT_RECORD_BUTTON)]
         ],
         resize_keyboard=True
@@ -82,117 +81,108 @@ def clean_filename(title: str) -> str:
 
 async def safe_edit_text(msg: Message, text: str):
     try:
-        await msg.edit_text(text, parse_mode="Markdown", disable_web_page_preview=True)
+        await msg.edit_text(text, parse_mode="Markdown")
     except Exception:
-        await msg.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+        await msg.answer(text, parse_mode="Markdown")
 
-# Функция парсинга HTML YouTube без использования API yt-dlp
-def scrape_youtube_search(query: str):
-    try:
-        encoded_query = urllib.parse.quote(query)
-        url = f"https://www.youtube.com/results?search_query={encoded_query}"
-        
-        req = urllib.request.Request(
-            url, 
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        )
-        
-        html = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
-        # Ищем ID видео и их названия в JSON-структуре страницы YouTube
-        video_ids = re.findall(r"\"videoId\":\"([^\"]+)\"", html)
-        titles = re.findall(r"\"title\":\{\"runs\":\[\{\"text\":\"([^\"]+)\"\}", html)
-        
-        results = []
-        seen_ids = set()
-        
-        for i in range(len(video_ids)):
-            v_id = video_ids[i]
-            if v_id not in seen_ids:
-                seen_ids.add(v_id)
-                # Берем соответствующее название, если оно есть
-                v_title = titles[i] if i < len(titles) else "Ремикс/Трек"
-                # Декодируем юникод-символы в названии, если они смазались
-                v_title = v_title.encode().decode('unicode-escape', errors='ignore')
-                results.append({"id": v_id, "title": v_title})
-                if len(results) >= 5: # Нам нужно топ-5 результатов
-                    break
-        return results
-    except Exception as e:
-        logging.error(f"Scraping error: {e}")
-        return []
+# Функция скачивания файлов по прямой ссылке в локальную папку
+async def download_file_by_url(url: str, destination: str):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            if response.status == 200:
+                with open(destination, 'wb') as f:
+                    f.write(await response.read())
+                return True
+    return False
 
-async def download_media(url: str, mode: str, message: Message):
+# Метод А: Скачивание SoundCloud через локальный yt-dlp
+async def download_soundcloud(url: str, message: Message):
     status_msg = await message.answer(TXT_PROCESSING)
     clean_bot_name = BOT_USERNAME.replace("@", "")
+    os.makedirs("downloads", exist_ok=True)
     
-    ydl_opts_info = {**YTDL_COMMON_OPTS, 'skip_download': True, 'ignoreerrors': True}
+    out_template = f"downloads/soundcloud_{clean_bot_name}.%(ext)s"
+    opts = {**YTDL_SOUNDCLOUD_OPTS, 'outtmpl': out_template}
     
     try:
-        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                raise ValueError("Не удалось извлечь информацию о файле.")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info).rsplit('.', 1)[0] + ".mp3"
             
-            duration = info.get('duration', 0)
-            title = clean_filename(info.get('title', 'media'))
-            
-            if duration and duration > 1500:
-                await safe_edit_text(status_msg, TXT_LIMIT_EXCEEDED)
-                return
+        await message.reply_audio(FSInputFile(filename))
+        STATS["audio"] += 1
+        if os.path.exists(filename):
+            os.remove(filename)
+        await status_msg.delete()
+    except Exception as e:
+        logging.error(f"SoundCloud error: {e}")
+        await safe_edit_text(status_msg, TXT_ERROR)
 
-        out_template = f"downloads/{title}_{clean_bot_name}.%(ext)s"
-        os.makedirs("downloads", exist_ok=True)
+# Метод Б: Хитрое скачивание YT/TikTok через сторонний API (Cobalt)
+async def download_via_service(url: str, mode: str, message: Message):
+    status_msg = await message.answer(TXT_PROCESSING)
+    clean_bot_name = BOT_USERNAME.replace("@", "")
+    os.makedirs("downloads", exist_ok=True)
+    
+    # Настраиваем параметры запроса к стороннему сайту
+    payload = {
+        "url": url,
+        "vQuality": "720",          # Оптимальное качество для быстрой передачи в Телеграм
+        "filenamePattern": "classic"
+    }
+    
+    # Если пользователю нужен только звук (MP3)
+    if mode == "mp3":
+        payload["isAudioOnly"] = True
+        payload["aFormat"] = "mp3"
 
-        if mode == "mp3":
-            ydl_opts = {
-                **YTDL_COMMON_OPTS,
-                'format': 'ba/b',
-                'outtmpl': out_template,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info).rsplit('.', 1)[0] + ".mp3"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(COBALT_API_URL, json=payload, headers=headers) as response:
+                if response.status != 200:
+                    raise ValueError(f"Сервер вернул код {response.status}")
                 
-            await message.reply_audio(FSInputFile(filename))
-            STATS["audio"] += 1
-            if os.path.exists(filename):
-                os.remove(filename)
-
-        elif mode == "mp4":
-            ydl_opts = {
-                **YTDL_COMMON_OPTS,
-                'format': 'b[ext=mp4]/bestvideo+bestaudio/b', 
-                'outtmpl': out_template,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                if not filename.endswith('.mp4'):
-                    base_path = filename.rsplit('.', 1)[0]
-                    if os.path.exists(base_path + ".mp4"):
-                        filename = base_path + ".mp4"
-                    elif os.path.exists(filename):
-                        os.rename(filename, base_path + ".mp4")
-                        filename = base_path + ".mp4"
+                res_json = await response.json()
+                
+                # Если это TikTok с кучей картинок (слайдшоу), Cobalt вернет список 'picker'
+                if "picker" in res_json:
+                    await safe_edit_text(status_msg, "📸 Это слайдшоу из картинок. Скачиваю первое фото/аудио...")
+                    direct_url = res_json["picker"][0]["url"]
+                else:
+                    direct_url = res_json.get("url")
+                
+                if not direct_url:
+                    raise ValueError("Сторонний сервер не выдал прямую ссылку.")
+                
+                # Качаем файл к себе на сервер, чтобы красиво переслать пользователю
+                ext = "mp3" if mode == "mp3" else "mp4"
+                local_filename = f"downloads/media_{clean_bot_name}.{ext}"
+                
+                success = await download_file_by_url(direct_url, local_filename)
+                if not success:
+                    raise ValueError("Не удалось сохранить файл со стороннего сервера.")
+                
+                # Отправляем в Telegram
+                if mode == "mp3":
+                    await message.reply_audio(FSInputFile(local_filename))
+                    STATS["audio"] += 1
+                else:
+                    await message.reply_video(FSInputFile(local_filename))
+                    STATS["video"] += 1
+                
+                if os.path.exists(local_filename):
+                    os.remove(local_filename)
                     
-            await message.reply_video(FSInputFile(filename))
-            STATS["video"] += 1
-            if os.path.exists(filename):
-                os.remove(filename)
-            
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+                await status_msg.delete()
 
     except Exception as e:
-        logging.error(f"Ошибка при скачивании: {e}")
-        await safe_edit_text(status_msg, TXT_ERROR)
+        logging.error(f"Cobalt API error: {e}")
+        await safe_edit_text(status_msg, f"{TXT_ERROR}\n\n*Инфо:* Сервер перегружен или ссылка не поддерживается.")
 
 
 # --- ОБРАБОТЧИКИ СОБЫТИЙ ---
@@ -208,68 +198,16 @@ async def show_record(message: Message):
     txt = f"🏆 **Статистика скачиваний:**\n\n🎵 Аудио: {STATS['audio']}\n🎥 Видео: {STATS['video']}\n\nВсего скачано: {total} файлов."
     await message.answer(txt)
 
-@dp.message(F.text == TXT_SEARCH_BUTTON)
-async def search_sc_start(message: Message, state: FSMContext):
-    await message.answer(TXT_ENTER_QUERY)
-    await state.set_state(BotStates.waiting_for_search_query)
-
-@dp.message(BotStates.waiting_for_search_query)
-async def search_sc_process(message: Message, state: FSMContext):
-    query = message.text.strip()
-    
-    if "http://" in query or "https://" in query:
-        await state.clear()
-        await handle_urls(message, state)
-        return
-
-    status_msg = await message.answer(TXT_SEARCH_ING)
-    
-    try:
-        # Запускаем парсинг веб-страницы в отдельном потоке, чтобы бот не зависал
-        loop = asyncio.get_event_loop()
-        entries = await loop.run_in_executor(None, scrape_youtube_search, query)
-        
-        if not entries:
-            await safe_edit_text(status_msg, TXT_NOT_FOUND)
-            await state.clear()
-            return
-        
-        response_text = "🎵 **Найденные треки:**\n\n"
-        valid_tracks_count = 0
-        
-        for i, entry in enumerate(entries, 1):
-            title = entry["title"]
-            video_id = entry["id"]
-            url = f"https://www.youtube.com/watch?v={video_id}"
-            response_text += f"{i}. [{title}]({url})\n\n"
-            valid_tracks_count += 1
-        
-        response_text += "👉 **Нажмите на нужную ссылку выше, отправьте её мне в чат, и я пришлю её в MP3!**"
-        
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-        await message.answer(response_text, parse_mode="Markdown", disable_web_page_preview=True)
-        
-    except Exception as e:
-        logging.error(f"Ошибка поиска: {e}")
-        await safe_edit_text(status_msg, TXT_ERROR)
-    
-    await state.clear()
-
 @dp.message(F.text.contains("http://") | F.text.contains("https://"))
 async def handle_urls(message: Message, state: FSMContext):
     url = message.text.strip()
     await state.clear()
     
     if "soundcloud.com" in url:
-        await download_media(url, "mp3", message)
-    elif "youtube.com" in url or "youtu.be" in url or "tiktok.com" in url:
-        await state.update_data(current_url=url)
-        await state.set_state(BotStates.waiting_for_format_selection)
-        await message.answer(TXT_CHOOSE_FORMAT, reply_markup=get_format_keyboard())
+        # Прямой SoundCloud обрабатываем как обычно нашими силами
+        await download_soundcloud(url, message)
     else:
+        # Для YT и TikTok вызываем меню выбора формата, а скачивать будем через Кобальт
         await state.update_data(current_url=url)
         await state.set_state(BotStates.waiting_for_format_selection)
         await message.answer(TXT_CHOOSE_FORMAT, reply_markup=get_format_keyboard())
@@ -295,10 +233,10 @@ async def process_download_callback(callback: CallbackQuery, state: FSMContext):
     await state.clear() 
     
     if mode == "both":
-        await download_media(url, "mp3", callback.message)
-        await download_media(url, "mp4", callback.message)
+        await download_via_service(url, "mp3", callback.message)
+        await download_via_service(url, "mp4", callback.message)
     else:
-        await download_media(url, mode, callback.message)
+        await download_via_service(url, mode, callback.message)
 
 async def main():
     await dp.start_polling(bot)
