@@ -278,7 +278,7 @@ def download_youtube_mp4(url: str):
 
     opts = {
         **YTDL_BASE_OPTS,
-        "format": "bestvideo+bestaudio/best",
+        "format": "best[height<=720]",
         "merge_output_format": "mp4",
         "outtmpl": outtmpl
     }
@@ -346,7 +346,7 @@ async def send_audio_file(
     title: str,
     performer: str
 ):
-    await message.reply_audio(
+    await message.answer_audio(
         audio=FSInputFile(file_path),
         title=f"{title} {BOT_TAG}",
         performer=performer
@@ -361,7 +361,7 @@ async def send_video_file(
     file_path: str,
     title: str
 ):
-    await message.reply_video(
+    await message.answer_video(
         video=FSInputFile(file_path),
         caption=f"🎬 {title}\n\n{BOT_TAG}"
     )
@@ -578,9 +578,11 @@ async def process_callback(
     )
 
     try:
-        await callback.message.delete()
-    except Exception:
-        pass
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
+except Exception:
+    pass
 
     await state.clear()
 
