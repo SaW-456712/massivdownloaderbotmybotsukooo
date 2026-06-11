@@ -1,2 +1,3 @@
 aiogram==3.13.1
-yt-dlp==2025.01.26
+aiohttp
+yt-dlp
