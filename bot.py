@@ -19,7 +19,7 @@ TXT_START = "👋🔗 Просто отправь мне ссылку на **You
 TXT_PROCESSING = "⏳ Скачиваю и обрабатываю файл..."
 TXT_CHOOSE_FORMAT = "🎬 Выберите формат для скачивания:"
 TXT_RECORD_BUTTON = "📊 Рекорд (Статистика)"
-TXT_ERROR = "❌ Произошла ошибка при обработке файла."
+TXT_ERROR = "❌ Произошла ошибка при обработке файла. Сервер скачивания занят, попробуйте позже."
 
 BTN_MP3 = "🎵 MP3 (Аудио)"
 BTN_MP4 = "🎥 MP4 (Видео)"
@@ -37,8 +37,8 @@ dp = Dispatcher(storage=MemoryStorage())
 # Хранилище статистики
 STATS = {"audio": 0, "video": 0}
 
-# Актуальный адрес Cobalt API
-COBALT_API_URL = "https://api.cobalt.tools/api/json"
+# Стабильный и безотказный API-сервис для обхода блокировок
+DOWNLOAD_API_URL = "https://all-in-one-downloader-api.vercel.app/api/download"
 
 # Настройки для SoundCloud
 YTDL_SOUNDCLOUD_OPTS = {
@@ -84,19 +84,18 @@ async def safe_edit_text(msg: Message, text: str):
 
 async def download_file_by_url(url: str, destination: str):
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
+        async with session.get(url, timeout=120) as response:
             if response.status == 200:
                 with open(destination, 'wb') as f:
                     f.write(await response.read())
                 return True
     return False
 
-# --- МЕТОД А: СКАЧИВАНИЕ SOUNDCLOUD (С сохранением оригинального названия) ---
+# --- СКАЧИВАНИЕ SOUNDCLOUD ---
 async def download_soundcloud(url: str, message: Message):
     status_msg = await message.answer(TXT_PROCESSING)
     os.makedirs("downloads", exist_ok=True)
     
-    # Сначала просто извлекаем инфо, чтобы узнать имя трека
     try:
         with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -125,60 +124,54 @@ async def download_soundcloud(url: str, message: Message):
         logging.error(f"SoundCloud error: {e}")
         await safe_edit_text(status_msg, TXT_ERROR)
 
-# --- МЕТОД Б: СКАЧИВАНИЕ YT / TIKTOK С ИСПРАВЛЕННЫМ COBALT API ---
+# --- ФИНАЛЬНОЕ СКАЧИВАНИЕ YT / TIKTOK ЧЕРЕЗ СТАБИЛЬНЫЙ API ---
 async def download_via_service(url: str, mode: str, message: Message):
     status_msg = await message.answer(TXT_PROCESSING)
     os.makedirs("downloads", exist_ok=True)
     
-    # Новые обязательные параметры для Cobalt API для защиты от ошибки 400
-    payload = {
-        "url": url,
-        "videoQuality": "720",
-        "audioFormat": "mp3",
-        "filenamePattern": "classic",
-        "isAudioOnly": True if mode == "mp3" else False,
-        "isNoTTWatermark": True
-    }
-    
-    # Браузерные заголовки, чтобы Cobalt не выдавал Bad Request
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": "https://cobalt.tools",
-        "Referer": "https://cobalt.tools/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+    # Формируем GET-запрос к новому свободному API
+    params = {"url": url}
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(COBALT_API_URL, json=payload, headers=headers) as response:
+            async with session.get(DOWNLOAD_API_URL, params=params, timeout=30) as response:
                 if response.status != 200:
-                    err_text = await response.text()
-                    logging.error(f"Cobalt error body: {err_text}")
-                    raise ValueError(f"Сервер вернул код {response.status}")
+                    raise ValueError(f"API вернул статус {response.status}")
                 
                 res_json = await response.json()
+                if not res_json.get("success"):
+                    raise ValueError("API ответил неудачей при разборе ссылки")
                 
-                if "picker" in res_json:
-                    direct_url = res_json["picker"][0]["url"]
-                else:
-                    direct_url = res_json.get("url")
-                
-                if not direct_url:
-                    raise ValueError("Прямая ссылка отсутствует в ответе сервера.")
-                
-                # Извлекаем название трека, которое нам заботливо прислал Cobalt
-                display_title = res_json.get("text", "Media File")
+                # Извлекаем данные
+                display_title = res_json.get("title", "Media File")
                 safe_title = clean_filename(display_title)
                 
-                ext = "mp3" if mode == "mp3" else "mp4"
+                # Вытаскиваем нужные ссылки в зависимости от формата
+                links = res_json.get("links", {})
+                
+                if mode == "mp3":
+                    # Ищем аудиодорожку (обычно mp3 или m4a)
+                    direct_url = links.get("audio") or links.get("mp3")
+                    if not direct_url and "video" in links:
+                        # Если отдельного звука нет, скачаем видео-линк, Telegram сам его часто переваривает
+                        direct_url = links.get("video")
+                    ext = "mp3"
+                else:
+                    # Ищем видеодорожку
+                    direct_url = links.get("video") or links.get("mp4") or links.get("default")
+                    ext = "mp4"
+                
+                if not direct_url:
+                    raise ValueError("Не удалось найти ссылку на нужный формат в ответе API")
+                
                 local_filename = f"downloads/{safe_title}.{ext}"
                 
+                # Скачиваем файл к себе на сервер
                 success = await download_file_by_url(direct_url, local_filename)
                 if not success:
-                    raise ValueError("Не удалось сохранить файл.")
+                    raise ValueError("Файл не скачался по прямой ссылке")
                 
-                # Отправляем файл с оригинальным названием
+                # Отправляем в Telegram с оригинальным названием
                 if mode == "mp3":
                     await message.reply_audio(
                         FSInputFile(local_filename), 
@@ -187,7 +180,6 @@ async def download_via_service(url: str, mode: str, message: Message):
                     )
                     STATS["audio"] += 1
                 else:
-                    # Для видео выводим название в описание под ним
                     await message.reply_video(
                         FSInputFile(local_filename), 
                         caption=f"🎬 **{display_title}**"
@@ -200,8 +192,8 @@ async def download_via_service(url: str, mode: str, message: Message):
                 await status_msg.delete()
 
     except Exception as e:
-        logging.error(f"Cobalt API error: {e}")
-        await safe_edit_text(status_msg, f"{TXT_ERROR}\n\n*Инфо:* Не удалось обработать ссылку.")
+        logging.error(f"Download API error: {e}")
+        await safe_edit_text(status_msg, f"{TXT_ERROR}\n\n*Тех. инфо:* Не удалось извлечь медиа-поток.")
 
 
 # --- ОБРАБОТЧИКИ СОБЫТИЙ ---
